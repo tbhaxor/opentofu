@@ -7,12 +7,14 @@ package configs
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	hcljson "github.com/hashicorp/hcl/v2/json"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/gocty"
 
 	"github.com/opentofu/opentofu/internal/addrs"
 	"github.com/opentofu/opentofu/internal/configs/hcl2shim"
@@ -66,6 +68,19 @@ type Resource struct {
 	TypeRange hcl.Range
 }
 
+type HealthyBeforeDestroy struct {
+	// URL is kept expression for lazy eval when creation of resource is completed
+	URL hcl.Expression
+
+	// Evaluated during decodeResourceBlock run
+	Timeout   time.Duration
+	Interval  time.Duration
+	Retries   uint64
+	OnFailure string
+
+	DefRange *hcl.Range
+}
+
 // ManagedResource represents a "resource" block in a module or file.
 type ManagedResource struct {
 	Connection   *Connection
@@ -82,6 +97,8 @@ type ManagedResource struct {
 	IgnoreAllChanges bool
 
 	CreateBeforeDestroySet bool
+
+	HealthyBeforeDestroy *HealthyBeforeDestroy
 }
 
 func (r *Resource) moduleUniqueKey() string {
@@ -306,6 +323,22 @@ func decodeResourceBlock(block *hcl.Block, override bool) (*Resource, hcl.Diagno
 					case "postcondition":
 						r.Postconditions = append(r.Postconditions, cr)
 					}
+				case "healthy_before_destroy":
+					if r.Managed.HealthyBeforeDestroy != nil {
+						diags = append(diags, &hcl.Diagnostic{
+							Severity: hcl.DiagError,
+							Summary:  "Duplicate healthy_before_destroy block",
+							Detail:   fmt.Sprintf("Only one healthy_before_destroy block is allowed per resource. Another healthy_before_destroy block was already defined at %s.", r.Managed.HealthyBeforeDestroy.DefRange),
+							Subject:  block.DefRange.Ptr(),
+						})
+						continue
+					}
+					hcb, moreDiags := decodeHealthyBeforeDestroyBlock(block, override)
+					r.Managed.HealthyBeforeDestroy = hcb
+					diags = append(diags, moreDiags...)
+					// Implicit set doesn't enable CreateBeforeDestroySet flag.
+					r.Managed.CreateBeforeDestroy = true
+					fmt.Printf("%+v\n", *hcb)
 				default:
 					// The cases above should be exhaustive for all block types
 					// defined in the lifecycle schema, so this shouldn't happen.
@@ -1092,6 +1125,142 @@ func (r *ProviderConfigRef) InstanceValidation(blockType string, isInstanced boo
 	return diags
 }
 
+func decodeHealthyBeforeDestroyBlock(block *hcl.Block, override bool) (blk *HealthyBeforeDestroy, diags hcl.Diagnostics) {
+	blk = &HealthyBeforeDestroy{DefRange: block.DefRange.Ptr()}
+	diags = make(hcl.Diagnostics, 0)
+
+	if override {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Can't override healthy_before_destroy blocks",
+			Detail:   "Override files cannot override \"healthy_before_destroy\" blocks.",
+			Subject:  block.DefRange.Ptr(),
+		})
+		return
+	}
+
+	// 2. Parse the body against the schema
+	content, contentDiags := block.Body.Content(healthyBeforeDestroyBlockSchema)
+	diags = append(diags, contentDiags...)
+
+	if url, exists := content.Attributes["url"]; exists {
+		blk.URL = url.Expr
+	}
+
+	if attr, exists := content.Attributes["timeout"]; exists {
+		val, valDiags := attr.Expr.Value(nil)
+		diags = append(diags, valDiags...)
+		if !valDiags.HasErrors() {
+			if val.Type() != cty.String {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid timeout value",
+					Detail:   "timeout must be a duration string (e.g. \"90s\").",
+					Subject:  attr.Expr.Range().Ptr(),
+				})
+			} else if duration, err := time.ParseDuration(val.AsString()); err != nil {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid timeout duration",
+					Detail:   err.Error(),
+					Subject:  attr.Expr.Range().Ptr(),
+				})
+			} else {
+				blk.Timeout = duration
+			}
+		}
+	} else {
+		blk.Timeout = 5 * time.Second
+	}
+
+	if attr, exists := content.Attributes["interval"]; exists {
+		val, valDiags := attr.Expr.Value(nil)
+		diags = append(diags, valDiags...)
+		if !valDiags.HasErrors() {
+			if val.Type() != cty.String {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid interval value",
+					Detail:   "interval must be a duration string (e.g. \"5s\").",
+					Subject:  attr.Expr.Range().Ptr(),
+				})
+			} else if duration, err := time.ParseDuration(val.AsString()); err != nil {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid interval duration",
+					Detail:   err.Error(),
+					Subject:  attr.Expr.Range().Ptr(),
+				})
+			} else {
+				blk.Interval = duration
+			}
+		}
+	} else {
+		blk.Interval = 10 * time.Second
+	}
+
+	if attr, exists := content.Attributes["retries"]; exists {
+		val, valDiags := attr.Expr.Value(nil) // constant only
+		diags = append(diags, valDiags...)
+		if !valDiags.HasErrors() {
+			if val.Type() != cty.Number {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid retries value",
+					Detail:   "retries must be a number.",
+					Subject:  attr.Expr.Range().Ptr(),
+				})
+			} else {
+				var retries uint64
+				err := gocty.FromCtyValue(val, &retries)
+				if err != nil {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Unable to parse retries",
+						Detail:   err.Error(),
+						Subject:  attr.Expr.Range().Ptr(),
+					})
+				} else {
+					blk.Retries = retries // or keep uint64 if you prefer
+				}
+			}
+		}
+	} else {
+		blk.Retries = 5
+	}
+
+	if attr, exists := content.Attributes["on_failure"]; exists {
+		// on_failure is usually a constant string
+		val, valDiags := attr.Expr.Value(nil)
+		diags = append(diags, valDiags...)
+		if !valDiags.HasErrors() {
+			if val.Type() != cty.String {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid on_failure value",
+					Detail:   "on_failure must be a string (\"enforce\" or \"ignore\").",
+					Subject:  attr.Expr.Range().Ptr(),
+				})
+			} else {
+				s := val.AsString()
+				if s != "enforce" && s != "ignore" {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Invalid on_failure value",
+						Detail:   "on_failure must be \"enforce\" or \"ignore\".",
+						Subject:  attr.Expr.Range().Ptr(),
+					})
+				}
+				blk.OnFailure = s
+			}
+		}
+	} else {
+		blk.OnFailure = "enforce"
+	}
+
+	return
+}
+
 var commonResourceAttributes = []hcl.AttributeSchema{
 	{
 		Name: "count",
@@ -1132,6 +1301,16 @@ var dataBlockSchema = &hcl.BodySchema{
 	},
 }
 
+var healthyBeforeDestroyBlockSchema = &hcl.BodySchema{
+	Attributes: []hcl.AttributeSchema{
+		{Name: "url", Required: true},
+		{Name: "timeout", Required: false},
+		{Name: "interval", Required: false},
+		{Name: "retries", Required: false},
+		{Name: "on_failure", Required: false},
+	},
+}
+
 var resourceLifecycleBlockSchema = &hcl.BodySchema{
 	// We tell HCL that these elements are all valid for both "resource"
 	// and "data" lifecycle blocks, but the rules are actually more restrictive
@@ -1160,5 +1339,6 @@ var resourceLifecycleBlockSchema = &hcl.BodySchema{
 	Blocks: []hcl.BlockHeaderSchema{
 		{Type: "precondition"},
 		{Type: "postcondition"},
+		{Type: "healthy_before_destroy"},
 	},
 }

@@ -9,7 +9,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"time"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/opentofu/opentofu/internal/addrs"
 	"github.com/opentofu/opentofu/internal/configs"
 	"github.com/opentofu/opentofu/internal/instances"
@@ -20,6 +25,7 @@ import (
 	"github.com/opentofu/opentofu/internal/tfdiags"
 	"github.com/opentofu/opentofu/internal/tracing"
 	"github.com/opentofu/opentofu/internal/tracing/traceattrs"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // NodeApplyableResourceInstance represents a resource instance that is
@@ -396,6 +402,10 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx context.Conte
 	// the provisioner errors count as port of the apply error, so we can bundle the diags
 	diags = diags.Append(applyProvisionersDiags)
 
+	if n.CreateBeforeDestroy() && n.Config.Managed.HealthyBeforeDestroy != nil && n.Config.Managed.HealthyBeforeDestroy.Retries > 0 {
+		diags = append(diags, n.executeHealthChecks(ctx, evalCtx, state)...)
+	}
+
 	state = maybeTainted(addr.Absolute(evalCtx.Path()), state, diffApply, diags.Err())
 
 	err = n.writeResourceInstanceState(ctx, evalCtx, state, workingState)
@@ -445,6 +455,62 @@ func (n *NodeApplyableResourceInstance) managedResourceExecute(ctx context.Conte
 	// the result of the operation, and to fail on future operations
 	// until the user makes the condition succeed.
 	return diags.Append(n.managedResourcePostconditions(ctx, evalCtx, repeatData))
+}
+
+func (n *NodeApplyableResourceInstance) executeHealthChecks(ctx context.Context, evalCtx EvalContext, state *states.ResourceInstanceObject) (diags tfdiags.Diagnostics) {
+	diags = make(tfdiags.Diagnostics, 0)
+
+	if state == nil || state.Value.IsNull() {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Cannot run healthy_before_destroy",
+			"No resource state available to evaluate health check URL.",
+		))
+		return diags
+	}
+
+	hbd := n.Config.Managed.HealthyBeforeDestroy
+	urlVal, evalDiags := evalCtx.EvaluateExpr(
+		ctx,
+		hbd.URL,
+		cty.String,
+		n.Addr.Resource, // ← this is the Referenceable
+	)
+	diags = diags.Append(evalDiags)
+	urlStr := urlVal.AsString()
+
+	if urlStr == "" {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Invalid health check URL",
+			"healthy_before_destroy url evaluated to an empty or unknown value.",
+		))
+		return diags
+	}
+
+	parsedURL, err := url.Parse(urlVal.AsString())
+	if err != nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid health check URL",
+			Detail:   fmt.Sprintf("Failed to parse URL %q: %s", urlVal.AsString(), err),
+			Subject:  hbd.URL.Range().Ptr(),
+		})
+		return diags
+	}
+
+	if diags.HasErrors() {
+		return
+	}
+
+	switch parsedURL.Scheme {
+	case "http", "https":
+		return n.runHttpHealthChecks(ctx, parsedURL.String(), hbd)
+	case "tcp":
+		return n.runTCPHealthChecks(ctx, parsedURL.Host, hbd)
+
+	}
+	return
 }
 
 func (n *NodeApplyableResourceInstance) managedResourcePostconditions(ctx context.Context, evalCtx EvalContext, repeatData instances.RepetitionData) (diags tfdiags.Diagnostics) {
@@ -529,6 +595,14 @@ func (n *NodeApplyableResourceInstance) checkPlannedChange(evalCtx EvalContext, 
 	return diags
 }
 
+// Close implements closableResource
+func (n *NodeApplyableResourceInstance) Close() (diags tfdiags.Diagnostics) {
+	if n.Addr.Resource.Resource.Mode != addrs.EphemeralResourceMode {
+		return diags
+	}
+	return n.NodeAbstractResourceInstance.Close()
+}
+
 // maybeTainted takes the resource addr, new value, planned change, and possible
 // error from an apply operation and return a new instance object marked as
 // tainted if it appears that a create operation has failed.
@@ -556,10 +630,133 @@ func maybeTainted(addr addrs.AbsResourceInstance, state *states.ResourceInstance
 	return state
 }
 
-// Close implements closableResource
-func (n *NodeApplyableResourceInstance) Close() (diags tfdiags.Diagnostics) {
-	if n.Addr.Resource.Resource.Mode != addrs.EphemeralResourceMode {
+func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context, url string, hbd *configs.HealthyBeforeDestroy) (diags tfdiags.Diagnostics) {
+	diags = make(tfdiags.Diagnostics, 0)
+
+	client := &http.Client{Timeout: hbd.Timeout}
+	var (
+		lastErr  error
+		success  bool
+		request  *http.Request
+		response *http.Response
+	)
+
+	for attempt := range hbd.Retries {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err()
+				break
+			case <-time.After(hbd.Interval):
+			}
+		}
+
+		// do not invoke http request when context is already cancelled
+		if lastErr == ctx.Err() {
+			break
+		}
+
+		request, lastErr = http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if lastErr == nil {
+			break
+		}
+
+		// Error in making request should be considered retry, maybe port is not open yet
+		response, lastErr = client.Do(request)
+		if lastErr != nil {
+			continue
+		}
+		defer func() { _ = response.Body.Close() }()
+
+		if response.StatusCode < 400 {
+			success = true
+			break
+		}
+
+	}
+
+	if success {
+		return
+	}
+
+	msg := fmt.Sprintf("HTTP health check failed for %s after %d attempts", n.Addr, hbd.Retries)
+	if lastErr != nil {
+		msg += ": " + lastErr.Error()
+	}
+
+	if hbd.OnFailure == "ignore" {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Warning,
+			"healthy_before_destroy check failed (ignored)",
+			msg,
+		))
 		return diags
 	}
-	return n.NodeAbstractResourceInstance.Close()
+
+	diags = diags.Append(tfdiags.Sourceless(
+		tfdiags.Error,
+		"healthy_before_destroy check failed",
+		msg,
+	))
+
+	return
+}
+
+func (n *NodeApplyableResourceInstance) runTCPHealthChecks(ctx context.Context, host string, hbd *configs.HealthyBeforeDestroy) (diags tfdiags.Diagnostics) {
+	diags = make(tfdiags.Diagnostics, 0)
+	dialer := &net.Dialer{Timeout: hbd.Timeout}
+
+	var (
+		conn    net.Conn
+		lastErr error
+		success bool
+	)
+
+	for attempt := range hbd.Retries {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				lastErr = ctx.Err()
+				break
+			case <-time.After(hbd.Interval):
+			}
+		}
+
+		// do not try to establish connection when context is already cancelled
+		if lastErr == ctx.Err() {
+			break
+		}
+
+		conn, lastErr = dialer.DialContext(ctx, "tcp", host)
+		if lastErr == nil {
+			_ = conn.Close()
+			success = true
+			break
+		}
+	}
+
+	if success {
+		return
+	}
+
+	msg := fmt.Sprintf("TCP health check failed for %s after %d attempts", n.Addr, hbd.Retries)
+	if lastErr != nil {
+		msg += ": " + lastErr.Error()
+	}
+
+	if hbd.OnFailure == "ignore" {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Warning,
+			"healthy_before_destroy check failed (ignored)",
+			msg,
+		))
+		return diags
+	}
+
+	diags = diags.Append(tfdiags.Sourceless(
+		tfdiags.Error,
+		"healthy_before_destroy check failed",
+		msg,
+	))
+	return
 }
