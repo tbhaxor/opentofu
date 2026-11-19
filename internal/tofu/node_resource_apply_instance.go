@@ -7,6 +7,7 @@ package tofu
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -634,8 +635,7 @@ func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context,
 
 	client := &http.Client{Timeout: hbd.Timeout}
 	var (
-		lastErr  error
-		success  bool
+		err      error
 		request  *http.Request
 		response *http.Response
 	)
@@ -644,52 +644,48 @@ func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context,
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				lastErr = ctx.Err()
-				break
+				err = ctx.Err()
 			case <-time.After(hbd.Interval):
 			}
 		}
 
-		// do not invoke http request when context is already cancelled
-		if lastErr == ctx.Err() {
+		// do not try to establish connection when context is already cancelled or deadline exceeded
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			break
 		}
 
-		request, lastErr = http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if lastErr == nil {
-			break
+		request, err = http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Attempt %d failed: %s", n.Addr, attempt+1, err))
+			continue
 		}
 
 		// Error in making request should be considered retry, maybe port is not open yet
-		response, lastErr = client.Do(request)
-		if lastErr != nil {
-			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Attempt %d failed: %s", n.Addr, attempt+1, lastErr))
+		response, err = client.Do(request)
+		if err != nil {
+			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Attempt %d failed: %s", n.Addr, attempt+1, err))
 			continue
 		}
-		defer func() { _ = response.Body.Close() }()
+		_ = response.Body.Close()
 
 		if response.StatusCode < 400 {
-			success = true
 			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Healthy after %d attempt(s)", n.Addr, attempt+1))
 			break
 		}
 
 	}
 
-	if success {
+	if err == nil {
 		return
 	}
 
-	msg := fmt.Sprintf("HTTP health check failed for %s after %d attempts", n.Addr, hbd.Retries)
-	if lastErr != nil {
-		msg += ": " + lastErr.Error()
-	}
+	err = fmt.Errorf("http health check failed for %s after %d attempts: %w", n.Addr, hbd.Retries, err)
 
 	if hbd.OnFailure == "ignore" {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Warning,
 			"healthy_before_destroy check failed (ignored)",
-			msg,
+			err.Error(),
 		))
 		return diags
 	}
@@ -697,7 +693,7 @@ func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context,
 	diags = diags.Append(tfdiags.Sourceless(
 		tfdiags.Error,
 		"healthy_before_destroy check failed",
-		msg,
+		err.Error(),
 	))
 
 	return
@@ -708,51 +704,44 @@ func (n *NodeApplyableResourceInstance) runTCPHealthChecks(ctx context.Context, 
 	dialer := &net.Dialer{Timeout: hbd.Timeout}
 
 	var (
-		conn    net.Conn
-		lastErr error
-		success bool
+		conn net.Conn
+		err  error
 	)
 
 	for attempt := range hbd.Retries {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				lastErr = ctx.Err()
-				break
+				err = ctx.Err()
 			case <-time.After(hbd.Interval):
 			}
 		}
 
-		// do not try to establish connection when context is already cancelled
-		if lastErr == ctx.Err() {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			break
 		}
 
-		conn, lastErr = dialer.DialContext(ctx, "tcp", host)
-		if lastErr == nil {
+		conn, err = dialer.DialContext(ctx, "tcp", host)
+		if err == nil {
 			_ = conn.Close()
-			success = true
 			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Healthy after %d attempt(s)", n.Addr, attempt+1))
 			break
 		}
 
-		n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Attempt %d failed: %s", n.Addr, attempt+1, lastErr))
+		n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Attempt %d failed: %s", n.Addr, attempt+1, err))
 	}
 
-	if success {
+	if err == nil {
 		return
 	}
 
-	msg := fmt.Sprintf("TCP health check failed for %s after %d attempts", n.Addr, hbd.Retries)
-	if lastErr != nil {
-		msg += ": " + lastErr.Error()
-	}
+	err = fmt.Errorf("tcp health check failed for %s after %d attempts: %w", n.Addr, hbd.Retries, err)
 
 	if hbd.OnFailure == "ignore" {
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Warning,
 			"healthy_before_destroy check failed (ignored)",
-			msg,
+			err.Error(),
 		))
 		return diags
 	}
@@ -760,7 +749,7 @@ func (n *NodeApplyableResourceInstance) runTCPHealthChecks(ctx context.Context, 
 	diags = diags.Append(tfdiags.Sourceless(
 		tfdiags.Error,
 		"healthy_before_destroy check failed",
-		msg,
+		err.Error(),
 	))
 	return
 }
