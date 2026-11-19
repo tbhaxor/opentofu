@@ -505,10 +505,9 @@ func (n *NodeApplyableResourceInstance) executeHealthChecks(ctx context.Context,
 
 	switch parsedURL.Scheme {
 	case "http", "https":
-		return n.runHttpHealthChecks(ctx, parsedURL.String(), hbd)
+		return n.runHttpHealthChecks(ctx, parsedURL.String(), hbd, evalCtx)
 	case "tcp":
-		return n.runTCPHealthChecks(ctx, parsedURL.Host, hbd)
-
+		return n.runTCPHealthChecks(ctx, parsedURL.Host, hbd, evalCtx)
 	}
 	return
 }
@@ -630,7 +629,7 @@ func maybeTainted(addr addrs.AbsResourceInstance, state *states.ResourceInstance
 	return state
 }
 
-func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context, url string, hbd *configs.HealthyBeforeDestroy) (diags tfdiags.Diagnostics) {
+func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context, url string, hbd *configs.HealthyBeforeDestroy, evalCtx EvalContext) (diags tfdiags.Diagnostics) {
 	diags = make(tfdiags.Diagnostics, 0)
 
 	client := &http.Client{Timeout: hbd.Timeout}
@@ -664,12 +663,14 @@ func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context,
 		// Error in making request should be considered retry, maybe port is not open yet
 		response, lastErr = client.Do(request)
 		if lastErr != nil {
+			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Attempt %d failed: %s", n.Addr, attempt+1, lastErr))
 			continue
 		}
 		defer func() { _ = response.Body.Close() }()
 
 		if response.StatusCode < 400 {
 			success = true
+			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Healthy after %d attempt(s)", n.Addr, attempt+1))
 			break
 		}
 
@@ -702,7 +703,7 @@ func (n *NodeApplyableResourceInstance) runHttpHealthChecks(ctx context.Context,
 	return
 }
 
-func (n *NodeApplyableResourceInstance) runTCPHealthChecks(ctx context.Context, host string, hbd *configs.HealthyBeforeDestroy) (diags tfdiags.Diagnostics) {
+func (n *NodeApplyableResourceInstance) runTCPHealthChecks(ctx context.Context, host string, hbd *configs.HealthyBeforeDestroy, evalCtx EvalContext) (diags tfdiags.Diagnostics) {
 	diags = make(tfdiags.Diagnostics, 0)
 	dialer := &net.Dialer{Timeout: hbd.Timeout}
 
@@ -731,8 +732,11 @@ func (n *NodeApplyableResourceInstance) runTCPHealthChecks(ctx context.Context, 
 		if lastErr == nil {
 			_ = conn.Close()
 			success = true
+			n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Healthy after %d attempt(s)", n.Addr, attempt+1))
 			break
 		}
+
+		n.healthCheckLog(evalCtx, fmt.Sprintf("%s: Attempt %d failed: %s", n.Addr, attempt+1, lastErr))
 	}
 
 	if success {
@@ -759,4 +763,11 @@ func (n *NodeApplyableResourceInstance) runTCPHealthChecks(ctx context.Context, 
 		msg,
 	))
 	return
+}
+
+func (n *NodeApplyableResourceInstance) healthCheckLog(evalCtx EvalContext, line string) {
+	_ = evalCtx.Hook(func(h Hook) (HookAction, error) {
+		h.ProvisionOutput(n.Addr, "healthy_before_destroy", line, nil)
+		return HookActionContinue, nil
+	})
 }
